@@ -1,38 +1,82 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ASCILINE | Real-Time ASCII Engine</title>
-    
+    <title>ASCILINE - Dynamic Typography Engine</title>
+
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+
     <!-- Core Styles -->
     <link rel="stylesheet" href="/static/style.css">
 </head>
 
 <body>
-    <!-- Live Status Indicator -->
-    <div id="status" class="status">Ready</div>
-
     <!-- Header Section -->
-    <h1>ASCILINE</h1>
-    <p class="subtitle">real-time ascii streaming engine</p>
+    <header class="blog-header">
+        <h1>ASCILINE</h1>
+        <p>Turning the web into a living, breathing typographic canvas.</p>
+    </header>
 
-    <!-- Main Player Container -->
-    <div id="player-container">
-        <!-- Text-based rendering (B&W Mode) -->
-        <pre id="ascii-player"></pre>
-        
-        <!-- Canvas-based rendering (Color Modes) -->
-        <canvas id="ascii-canvas"></canvas>
+    <!-- Main Content -->
+    <main class="blog-container">
+        <article class="blog-post">
+            <h2 class="post-title">The Web Was Never Meant to Be Static</h2>
+            <div class="post-meta">Manifesto // May 4, 2026 // ASCILINE Core Team</div>
 
-        <!-- Tap to Play Interaction Overlay -->
-        <div id="play-overlay">
-            <div class="play-btn"></div>
-            <span class="play-label">Tap to Play</span>
-        </div>
-    </div>
+            <p class="post-content">
+                Every character on this page is potential energy. The web was built on text — HTML, 
+                the very skeleton of every site you visit, is nothing but structured characters. Yet 
+                somewhere along the way, we forgot that text itself can be the medium, not just the 
+                message. ASCILINE exists to remind us: every glyph is a pixel waiting to move.
+            </p>
+
+            <!-- Video Wrapper -->
+            <div class="video-wrapper">
+                <div id="status" class="status">System Ready</div>
+
+                <!-- Main Player Container -->
+                <div id="player-container">
+                    <!-- Text-based rendering (B&W Mode) -->
+                    <pre id="ascii-player"></pre>
+
+                    <!-- Canvas-based rendering (Color Modes) -->
+                    <canvas id="ascii-canvas"></canvas>
+
+                    <!-- Interaction Overlay -->
+                    <div id="play-overlay">
+                        <div class="play-btn"></div>
+                        <span class="play-label">Initialize Uplink</span>
+                    </div>
+                </div>
+
+                <!-- Player Controls Bar -->
+                <div class="player-controls">
+                    <!-- Volume Control -->
+                    <div class="ctrl-group">
+                        <span class="ctrl-icon">VOL_</span>
+                        <input id="volume-slider" type="range" min="0" max="1" step="0.05" value="0.8">
+                    </div>
+                </div>
+
+                <!-- Hidden Audio Element -->
+                <audio id="ascii-audio" preload="none"></audio>
+            </div>
+
+            <p class="post-content">
+                This is not a video player in the traditional sense. There is no &lt;video&gt; tag here, 
+                no compressed binary stream decoded by your GPU. Instead, a WebSocket pushes raw 
+                character data at 24+ frames per second, and your browser renders it as pure text — 
+                the same primitive that built the entire internet. The web becomes dynamic not through 
+                heavier payloads, but by rethinking what was already there.
+            </p>
+        </article>
+    </main>
 
     <!-- Core Engine Logic -->
     <script src="/static/app.js"></script>
 </body>
+
 </html>

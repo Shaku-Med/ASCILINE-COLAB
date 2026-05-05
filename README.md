@@ -8,7 +8,7 @@
   <br>
   <img src="https://github.com/user-attachments/assets/6bd7f5c0-81de-49fe-ba0d-9a8872ec8ae3" width="600" alt="Animation-after" />
   <br>
-  <sub><i>* Showcases rendered using Mode 3 (32K Colors)</i></sub>
+  <sub><i>* Showcases rendered using Mode 3 (32K Colors) from a 30 FPS source video. The engine naturally synchronizes up to 60+ FPS depending on the source material.</i></sub>
 </p>
 
 ## 🎯 Strategic Vision & Core Capabilities
@@ -45,12 +45,18 @@ cd ASCILINE
 pip install fastapi uvicorn opencv-python numpy websockets
 ```
 
-### 3. Run the engine
+### 3. Run the Web Server
 Place a `video.mp4` in the root directory and start the server:
 ```bash
 python stream_server.py
 ```
 Open `http://localhost:8000` in your browser.
+
+### 4. Run directly in Terminal (Standalone)
+If you prefer to bypass the web interface, you can render the video directly inside an ANSI-supported terminal (zero-flicker, true color):
+```bash
+python ascii_video_player2.py video.mp4 --quality 0
+```
 
 ## 🎨 Customization
 

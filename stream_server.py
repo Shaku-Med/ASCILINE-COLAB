@@ -6,10 +6,11 @@ Dependencies: pip install fastapi uvicorn websockets
 """
 
 import asyncio
+import subprocess
 import numpy as np
 import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
@@ -33,6 +34,51 @@ def get_html_content():
 async def root():
     """Serves the Frontend (HTML/JS/CSS) file to the client."""
     return HTMLResponse(get_html_content())
+
+@app.get("/audio")
+async def audio_stream():
+    """
+    Extracts and streams audio from the video file using ffmpeg.
+    Returns an MP3 audio stream that the browser can play natively.
+    """
+    video_path = getattr(app.state, "video_path", "video.mp4")
+    
+    if not os.path.exists(video_path):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    def audio_generator():
+        # Use ffmpeg to extract audio as MP3 stream
+        process = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-i", video_path,
+                "-vn",               # No video
+                "-acodec", "libmp3lame",
+                "-ab", "128k",       # 128kbps bitrate
+                "-ar", "44100",      # Sample rate
+                "-f", "mp3",         # Output format
+                "-loglevel", "quiet",
+                "pipe:1"             # Output to stdout
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+        try:
+            while True:
+                chunk = process.stdout.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            process.stdout.close()
+            process.wait()
+    
+    return StreamingResponse(
+        audio_generator(),
+        media_type="audio/mpeg",
+        headers={"Accept-Ranges": "bytes"}
+    )
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

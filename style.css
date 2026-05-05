@@ -1,16 +1,18 @@
 /* 
-   ASCILINE ENGINE - Core Styles 
+   ASCILINE ENGINE - Minimal Blog Theme
    =========================================
-   Feel free to customize the look using the variables below.
+   Pure, performant, zero-decoration.
 */
 
 :root {
-    --bg-color: #050505;
-    --accent-color: #00ff41;
-    --accent-glow: rgba(0, 255, 65, 0.3);
-    --text-muted: rgba(255, 255, 255, 0.4);
-    --player-bg: #030303;
-    --font-main: 'Courier New', monospace;
+    --bg-color: #0a0a0c;
+    --text-color: #e0e0e0;
+    --accent-color: #00f3ff;
+    --accent-secondary: #39ff14;
+    --post-bg: #121217;
+    --font-main: 'Outfit', sans-serif;
+    --font-tech: 'Courier New', monospace;
+    --player-bg: #050505;
 }
 
 * {
@@ -21,120 +23,165 @@
 
 body {
     background-color: var(--bg-color);
+    color: var(--text-color);
+    font-family: var(--font-main);
+    line-height: 1.6;
+    overflow-x: hidden;
+}
+
+/* ── HEADER ───────────────────────── */
+.blog-header {
+    background-color: #000;
     color: var(--accent-color);
+    padding: 80px 20px;
+    text-align: center;
+    border-bottom: 1px solid #333;
+}
+
+.blog-header h1 {
+    font-size: 42px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    font-family: var(--font-tech);
+}
+
+.blog-header p {
+    font-size: 14px;
+    font-weight: 300;
+    opacity: 0.7;
+    letter-spacing: 2px;
+}
+
+/* ── MAIN CONTENT ─────────────────── */
+.blog-container {
+    max-width: 900px;
+    margin: 60px auto;
+    padding: 0 20px;
+}
+
+.blog-post {
+    background: var(--post-bg);
+    border-radius: 4px;
+    padding: 40px;
+    border: 1px solid #222;
+}
+
+.post-title {
+    font-size: 24px;
+    color: var(--accent-secondary);
+    margin-bottom: 5px;
+    font-weight: 600;
+    font-family: var(--font-tech);
+    border-left: 4px solid var(--accent-secondary);
+    padding-left: 15px;
+}
+
+.post-meta {
+    font-size: 11px;
+    color: #555;
+    margin-bottom: 30px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.post-content {
+    font-size: 16px;
+    color: #bbb;
+    margin-bottom: 30px;
+    font-weight: 300;
+}
+
+/* ── VIDEO WRAPPER ────────────────── */
+.video-wrapper {
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
-    min-height: 100vh;
-    font-family: var(--font-main);
-    overflow: hidden;
+    margin: 50px 0;
 }
-
-/* ── UI ELEMENTS ─────────────────────────── */
 
 .status {
-    position: fixed;
-    top: 12px;
-    left: 16px;
-    color: rgba(255, 255, 255, 0.6);
-    font-size: 13px;
-    font-family: monospace;
-    z-index: 100;
-}
-
-h1 {
-    color: var(--accent-color);
-    font-size: 18px;
-    letter-spacing: 6px;
-    text-transform: uppercase;
-    margin-bottom: 8px;
-    text-shadow: 0 0 10px var(--accent-glow);
-}
-
-.subtitle {
-    color: var(--text-muted);
     font-size: 11px;
-    letter-spacing: 3px;
-    margin-bottom: 24px;
+    color: var(--accent-color);
+    margin-bottom: 12px;
+    font-family: var(--font-tech);
+    text-transform: uppercase;
+    letter-spacing: 2px;
 }
 
-/* ── PLAYER CONTAINER ─────────────────────────── */
-
+/* ── PLAYER CONTAINER ──────────────── */
 #player-container {
     position: relative;
-    border: 1px solid rgba(0, 255, 65, 0.2);
-    box-shadow: 0 0 30px rgba(0, 255, 65, 0.06),
-                inset 0 0 30px rgba(0, 0, 0, 0.5);
     background: var(--player-bg);
-    cursor: pointer;
-    min-width: 500px;
-    min-height: 280px;
+    border-radius: 4px;
+    width: 860px;
+    height: 560px;
     display: flex;
     align-items: center;
     justify-content: center;
     overflow: hidden;
-    transition: border-color 0.4s ease, box-shadow 0.4s ease;
-}
-
-#player-container:hover {
-    border-color: rgba(0, 255, 65, 0.4);
-    box-shadow: 0 0 40px rgba(0, 255, 65, 0.1),
-                inset 0 0 30px rgba(0, 0, 0, 0.5);
+    border: 1px solid #333;
 }
 
 #ascii-player {
-    font-family: var(--font-main);
+    font-family: 'Courier New', monospace;
     white-space: pre;
     overflow: hidden;
     font-size: 8px;
     line-height: 8px;
-    letter-spacing: 0;
     font-weight: bold;
-    contain: content;
+    color: transparent;
+    /* Selection text is transparent */
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 5;
+    pointer-events: auto;
     display: none;
+    user-select: text;
 }
 
 #ascii-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 1;
     display: none;
 }
 
 /* ── OVERLAYS ───────────────────────── */
-
 #play-overlay {
     position: absolute;
-    top: 0; left: 0; right: 0; bottom: 0;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    background: rgba(3, 3, 3, 0.97);
+    background: rgba(0, 0, 0, 0.7);
     z-index: 10;
-    transition: opacity 0.5s ease;
     user-select: none;
+    cursor: pointer;
 }
 
 #play-overlay.hidden {
-    opacity: 0;
-    pointer-events: none;
+    display: none;
 }
 
 .play-btn {
-    width: 72px;
-    height: 72px;
-    border: 2px solid rgba(0, 255, 65, 0.5);
+    width: 60px;
+    height: 60px;
+    border: 3px solid var(--accent-color);
     border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
-    margin-bottom: 20px;
-    animation: pulse-glow 2.5s ease-in-out infinite;
-    transition: transform 0.2s ease, border-color 0.2s ease;
-}
-
-.play-btn:hover {
-    transform: scale(1.08);
-    border-color: var(--accent-color);
+    margin-bottom: 15px;
 }
 
 .play-btn::after {
@@ -143,25 +190,74 @@ h1 {
     width: 0;
     height: 0;
     border-style: solid;
-    border-width: 12px 0 12px 22px;
+    border-width: 10px 0 10px 18px;
     border-color: transparent transparent transparent var(--accent-color);
-    margin-left: 4px;
+    margin-left: 5px;
 }
 
 .play-label {
-    color: rgba(0, 255, 65, 0.5);
-    font-size: 11px;
-    letter-spacing: 5px;
+    color: #fff;
+    font-size: 12px;
+    letter-spacing: 2px;
     text-transform: uppercase;
+    font-weight: 600;
 }
 
-@keyframes pulse-glow {
-    0%, 100% {
-        box-shadow: 0 0 0 0 rgba(0, 255, 65, 0.3),
-                    0 0 15px rgba(0, 255, 65, 0.05);
-    }
-    50% {
-        box-shadow: 0 0 0 12px rgba(0, 255, 65, 0),
-                    0 0 25px rgba(0, 255, 65, 0.12);
-    }
+/* ── PLAYER CONTROLS BAR ───────────────── */
+.player-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+    padding: 8px 12px;
+    background: #1a1a1a;
+    border-radius: 8px;
+    border: 1px solid #333;
+    width: 100%;
+    max-width: 320px;
+    box-sizing: border-box;
+}
+
+.ctrl-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+}
+
+.ctrl-icon {
+    font-size: 14px;
+    opacity: 0.7;
+    flex-shrink: 0;
+}
+
+/* Styled range slider */
+#volume-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1;
+    height: 4px;
+    background: #444;
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+}
+
+#volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: var(--accent-color);
+    border-radius: 50%;
+    cursor: pointer;
+}
+
+#volume-slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    background: var(--accent-color);
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
 }
