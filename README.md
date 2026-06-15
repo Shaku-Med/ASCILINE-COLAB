@@ -221,7 +221,7 @@ If you find this project helpful, you can support me by donating crypto:
 
 ## 📜 License & Ethical Guardrails
 
-ASCILINE is distributed under the MIT License, but with a strict ethical guardrail. Because this engine bypasses standard browser constraints and ad-blockers (by rendering pure text instead of video), we strictly prohibit its use by ad-networks to serve unblockable advertisements. 
+ASCILINE is distributed under the MIT License, but with an anti ad strict ethical guardrail. 
 
 See the [LICENSE](LICENSE) file for the full text, which includes the **ANTI-ADVERTISEMENT RESTRICTION** clause.
 
