@@ -75,43 +75,66 @@ You can append the `--debug` flag when launching the server to see live bandwidt
 > diff (`experiments/test_e2e.js`). Generate the test clips with
 > `experiments/make_test_clips.sh`. (A fuller mutation-test + Autobahn
 
-## 🎞️ Pre-Rendered Mode (offline encode, no live CPU)
+## Prerendered Mode (do the work once, not while you watch)
 
-By default ASCILINE decodes + ASCII-encodes **every frame on the fly** over a
-WebSocket — so your CPU does that work the whole time you watch, and a heavy
-grid can starve the stream. **Pre-rendered mode** does the encoding **once,
-ahead of time**, writes it to a file, and plays it back like captions over a
-video: the audio is the master clock and the baked ASCII frames are shown in
-sync. No WebSocket, no live encoding at watch time.
+Normally ASCILINE turns each frame into ASCII live, while you watch, and sends
+it over a WebSocket. That means your CPU keeps working the whole time, and a big
+grid can make the video stutter.
 
-**1. Bake the assets** (run once; shows a progress bar with ETA):
+Prerendered mode does all that work one time, up front, and saves it to a file.
+Later it just plays the saved frames in time with the audio, kind of like
+subtitles on a video. There is no WebSocket and no live encoding while you watch,
+so playback stays smooth.
+
+**1. Build the files** (you only do this once. It shows a progress bar with a
+time estimate):
 ```bash
 python stream_server.py video.mp4 --mode 5 --cols 240 --prerender
+python stream_server.py video.mp4 --mode 5 --cols 240 --prerender --thumbnail --seek-thumbs  # also make previews
 ```
-This writes to `videos/ascidata/` (created automatically):
+Everything goes into `videos/ascidata/` (it makes the folder for you):
 
-| file | contents |
+| file | what it is |
 | :--- | :------- |
-| `<key>.aldata` | every frame as `[4B len][payload]` — binary modes reuse the adaptive codec, mode 1 stores the UTF-8 grid |
-| `<key>.mp3` | audio extracted at your `--vol` (omitted when `--vol 0`) |
-| `<key>.json` | manifest (fps, mode, grid size, frame count…) the browser reads to play it back |
+| `<key>.aldata` | all the frames, one after another |
+| `<key>.mp3` | the audio, at the volume you picked (skipped if `--vol 0`) |
+| `<key>.json` | a small info file the browser reads to play everything |
+| `<key>.thumb` | *(only with `--thumbnail`)* one ASCII frame used as a poster |
+| `<key>.sprite.jpg` | *(only with `--seek-thumbs`)* a grid of small frames for the seek bar preview |
 
-The `<key>` encodes everything that affects output (`video.m5.240x67`), so
-re-rendering at different settings never clobbers an existing bake. Works for all
-modes — including **mode 5 (16M colour)** and `--pixel`.
+`--thumbnail` picks one frame from early in the video (about 10% in, so it skips
+black intros) and saves it as a poster. The browser shows it behind the play
+button before you start.
 
-**2. Play the baked assets:**
+`--seek-thumbs` makes a grid of small frames sampled across the whole video (the
+same idea as a YouTube preview strip). When you hover the seek bar, the player
+shows the frame for that moment, so you can find the spot you want before you let
+go.
+
+The `<key>` part of the file name (like `video.m5.240x67`) includes your
+settings, so building the same video with different settings will not overwrite
+the old one. It works for every mode, including mode 5 (16M colour) and `--pixel`.
+
+**2. Play the files you built:**
 ```bash
 python stream_server.py video.mp4 --mode 5 --cols 240 --playback prerendered
 ```
-Open `http://localhost:8000` and hit play — it streams the file from disk and
-plays the audio in sync. `--playback live` (the default) keeps the original
-real-time WebSocket behaviour, so you can switch back any time. `--playlist`,
-`--folder`, and `--loop` all work the same in both modes.
+Open `http://localhost:8000` and press play. It reads the file from disk and
+plays the audio in time. The default is `--playback live`, which is the original
+live WebSocket way, so you can always go back to it. `--playlist`, `--folder`,
+and `--loop` work the same in both.
 
-> The grid size for playback is derived the same way as the bake, so the server
-> finds the matching assets automatically. If they're missing, the page tells
-> you to run `--prerender` first.
+> The browser figures out which files to use on its own, because the grid size is
+> worked out the same way when you build and when you play. If the files are not
+> there yet, the page will tell you to run `--prerender` first.
+
+**Player controls (prerendered mode):** now that the whole video is in a file,
+the web player gets normal controls: play and pause, a seek bar you can drag,
+skip back and forward 10 seconds, and speed from 0.5x up to 2x. Seeking is fast
+because the player jumps to the nearest keyframe and plays forward from there.
+This is also what fixes the old problem where the picture froze after you moved
+the audio. Live mode turns seek and speed off, because you cannot rewind a live
+stream.
 
 **LAN / Network Streaming:**
 To stream the video on your local network (Wi-Fi), use the `--host` flag:
