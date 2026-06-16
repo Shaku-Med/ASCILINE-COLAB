@@ -36,3 +36,5 @@ experiments/autobahn/reports/
 
 # stray temp dirs
 tmp*/
+
+.pytest_cache/
