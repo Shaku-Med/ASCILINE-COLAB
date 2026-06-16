@@ -54,6 +54,25 @@
 
                 <!-- Player Controls Bar -->
                 <div class="player-controls">
+                    <button id="btn-play" class="ctrl-btn" title="Play / Pause (Space)">▶</button>
+                    <button id="btn-back" class="ctrl-btn" title="Back 10s">«10</button>
+                    <span id="time-display" class="ctrl-time">0:00 / 0:00</span>
+                    <div class="seek-wrap">
+                        <div class="seek-track"></div>
+                        <div class="seek-buffered" id="seek-buffered"></div>
+                        <input id="seek-slider" class="seek-slider" type="range" min="0" max="100" step="0.05" value="0" title="Seek">
+                        <div class="seek-preview" id="seek-preview">
+                            <div class="seek-preview-img" id="seek-preview-img"></div>
+                            <div class="seek-preview-time" id="seek-preview-time">0:00</div>
+                        </div>
+                    </div>
+                    <button id="btn-fwd" class="ctrl-btn" title="Forward 10s">10»</button>
+                    <select id="speed-select" class="ctrl-select" title="Playback speed">
+                        <option value="0.5">0.5×</option>
+                        <option value="1" selected>1×</option>
+                        <option value="1.5">1.5×</option>
+                        <option value="2">2×</option>
+                    </select>
                     <!-- Volume Control -->
                     <div class="ctrl-group">
                         <span class="ctrl-icon">VOL_</span>
