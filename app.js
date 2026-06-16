@@ -21,6 +21,23 @@ let ws = null;
 const frameBuffer = [];
 const BUFFER_SIZE = 4;
 let codecDecoder = null; // Adaptive codec decoder (codec.js)
+
+// ── PLAYBACK MODE (live WebSocket vs pre-rendered file) ──
+// Decided by the server CLI (--playback). Fetched once from /config below.
+let playbackMode = 'live';      // 'live' | 'prerendered'
+let loopEnabled = false;
+let prerenderedQueue = [];      // array of manifests from /config
+let pqIndex = 0;                // which prerendered entry is playing
+let curManifest = null;
+// Pre-rendered decode pump (decodes the .aldata file ahead of playback)
+let pumpBytes = null, pumpView = null, pumpPos = 0, pumpFrameIdx = 0;
+let pumpRunning = false, pumpDone = false;
+
+fetch('/config').then(r => r.json()).then(cfg => {
+    playbackMode     = cfg.playback || 'live';
+    loopEnabled      = !!cfg.loop;
+    prerenderedQueue = cfg.queue || [];
+}).catch(() => { /* default to live */ });
 let targetFps = 24;
 let frameInterval = 1000 / targetFps;
 let renderMode = 1;
@@ -133,9 +150,15 @@ function buildCanvas(cols, rows) {
 function startStream() {
     if (state !== 'IDLE') return;
     overlay.classList.add('hidden');
-    statusEl.textContent = 'Connecting...';
     statusEl.style.color = 'var(--accent-color)';
-    connectWebSocket();
+    if (playbackMode === 'prerendered') {
+        statusEl.textContent = 'Loading…';
+        pqIndex = 0;
+        playPrerenderedEntry(pqIndex);
+    } else {
+        statusEl.textContent = 'Connecting...';
+        connectWebSocket();
+    }
 }
 
 function connectWebSocket() {
@@ -261,6 +284,114 @@ function connectWebSocket() {
 }
 
 // ═══════════════════════════════════════
+//  PRE-RENDERED PLAYBACK (no WebSocket)
+// ═══════════════════════════════════════
+// The .aldata file holds the exact same per-frame payloads the live socket
+// would have sent (codec.js decodes the binary ones, mode 1 is UTF-8 text), so
+// rendering reuses renderFrame() unchanged — mode 5 colours included. Audio is
+// the master clock, exactly like live, so it plays "captions-over-video" style.
+
+async function playPrerenderedEntry(i) {
+    const man = prerenderedQueue[i];
+    if (!man) { finishStream(); return; }
+    if (!man.available) {
+        statusEl.textContent = `Not pre-rendered: ${man.video || ''} — run with --prerender`;
+        statusEl.style.color = '#ff0000';
+        setTimeout(() => finishStream(), 3500);
+        return;
+    }
+
+    curManifest   = man;
+    targetFps     = man.fps;
+    frameInterval = 1000 / targetFps;
+    renderMode    = man.mode;
+    pixelMode     = !!man.pixel;
+    buildCanvas(man.cols, man.rows);
+
+    codecDecoder = (man.cellBytes > 0 && typeof AscilineCodec !== 'undefined')
+        ? AscilineCodec.makeDecoder(man.cellBytes)
+        : null;
+
+    // Reset buffers + decode pump for this entry
+    frameBuffer.length = 0;
+    pumpBytes = null; pumpView = null; pumpPos = 0; pumpFrameIdx = 0;
+    pumpRunning = false; pumpDone = false;
+    readyToRender = false;
+    state = 'PLAYING';
+
+    statusEl.textContent = 'Loading frames…';
+    let buf;
+    try {
+        buf = await fetch('/ascidata/' + man.data).then(r => r.arrayBuffer());
+    } catch (e) {
+        statusEl.textContent = 'Failed to load pre-rendered data.';
+        statusEl.style.color = '#ff0000';
+        setTimeout(() => finishStream(), 2500);
+        return;
+    }
+    if (state !== 'PLAYING') return; // stopped while loading
+    pumpBytes = new Uint8Array(buf);
+    pumpView  = new DataView(buf);
+
+    const begin = () => {
+        readyToRender   = true;
+        streamStartTime = performance.now();
+        lastRenderTime  = performance.now();
+        lastFpsUpdate   = lastRenderTime;
+        pumpDecode();
+        requestAnimationFrame(renderFrame);
+    };
+
+    if (man.audio && audioEl) {
+        audioEl.onended = () => advancePrerendered();
+        audioEl.pause();
+        audioEl.src = '/ascidata/' + man.audio + '?t=' + Date.now();
+        audioEl.volume = volumeSlider ? volumeSlider.value : 1.0;
+        audioEl.load();
+        audioEl.play().then(begin).catch(() => begin());
+    } else {
+        if (audioEl) { audioEl.onended = null; audioEl.removeAttribute('src'); }
+        begin();
+    }
+}
+
+// Decode frames a bounded distance ahead of the clock so memory stays small and
+// the UI never blocks. Deltas patch the previous frame, so order is mandatory.
+async function pumpDecode() {
+    if (pumpRunning || !pumpBytes) return;
+    pumpRunning = true;
+    while (state === 'PLAYING' && pumpPos < pumpBytes.length) {
+        if (frameBuffer.length > 90) {            // far enough ahead — yield
+            await new Promise(r => setTimeout(r, 16));
+            continue;
+        }
+        const len = pumpView.getUint32(pumpPos, false); pumpPos += 4;
+        const msg = pumpBytes.subarray(pumpPos, pumpPos + len); pumpPos += len;
+        if (codecDecoder) {
+            const { frameIndex, frame } = await codecDecoder.decode(msg);
+            frameBuffer.push({ data: frame, time: frameIndex / targetFps });
+        } else {
+            // Mode 1: payload is the raw UTF-8 character grid
+            frameBuffer.push({ data: textDecoder.decode(msg), time: pumpFrameIdx / targetFps });
+        }
+        pumpFrameIdx++;
+    }
+    if (pumpBytes && pumpPos >= pumpBytes.length) pumpDone = true;
+    pumpRunning = false;
+}
+
+function advancePrerendered() {
+    if (audioEl) audioEl.onended = null;
+    readyToRender = false;
+    pqIndex++;
+    if (pqIndex >= prerenderedQueue.length) {
+        if (loopEnabled) pqIndex = 0;
+        else { finishStream(); return; }
+    }
+    playPrerenderedEntry(pqIndex);
+}
+
+// ═══════════════════════════════════════
 //  RENDER LOOP
 // ═══════════════════════════════════════
 
@@ -276,7 +407,15 @@ function renderFrame(now) {
         masterClock = (now - streamStartTime) / 1000.0;
     }
 
-    if (frameBuffer.length === 0) return;
+    if (frameBuffer.length === 0) {
+        // Pre-rendered with no audio track: when the pump is drained and the
+        // buffer is empty, the video is over → advance the queue.
+        if (playbackMode === 'prerendered' && pumpDone &&
+            (!curManifest || !curManifest.audio)) {
+            advancePrerendered();
+        }
+        return;
+    }
 
     // A/V Sync: Drop frames that are too far behind the master clock (catch up)
     while (frameBuffer.length > 1 && frameBuffer[0].time < masterClock - 0.1) {
@@ -360,7 +499,7 @@ function renderFrame(now) {
 function finishStream() {
     state = 'IDLE';
     if (ws) { ws.onclose = null; ws.close(); ws = null; }
-    if (audioEl) { audioEl.pause(); audioEl.src = ''; }
+    if (audioEl) { audioEl.onended = null; audioEl.pause(); audioEl.src = ''; }
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     player.textContent = '';
     player.style.display = 'none';
@@ -371,6 +510,9 @@ function finishStream() {
     readyToRender = false;
     pauseStartTime = 0;
     frameBuffer.length = 0;
+    // Reset pre-rendered playback state
+    pumpBytes = null; pumpView = null; pumpDone = false; pumpRunning = false;
+    curManifest = null;
 }
 
 // ═══════════════════════════════════════
@@ -403,11 +545,14 @@ function togglePause() {
 
         // Flush stale buffer frames — A/V sync catch-up handles the rest
         frameBuffer.length = 0;
-        
+
         container.classList.remove('paused');
         statusEl.textContent = 'Resuming...';
         statusEl.style.color = 'var(--accent-color)';
-        
+
+        // Pre-rendered: the decode pump stopped while paused — kick it again
+        if (playbackMode === 'prerendered') pumpDecode();
+
         // Restart render loop
         lastRenderTime = performance.now();
         lastFpsUpdate = performance.now();

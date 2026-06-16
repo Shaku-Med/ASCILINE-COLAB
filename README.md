@@ -75,6 +75,44 @@ You can append the `--debug` flag when launching the server to see live bandwidt
 > diff (`experiments/test_e2e.js`). Generate the test clips with
 > `experiments/make_test_clips.sh`. (A fuller mutation-test + Autobahn
 
+## 🎞️ Pre-Rendered Mode (offline encode, no live CPU)
+
+By default ASCILINE decodes + ASCII-encodes **every frame on the fly** over a
+WebSocket — so your CPU does that work the whole time you watch, and a heavy
+grid can starve the stream. **Pre-rendered mode** does the encoding **once,
+ahead of time**, writes it to a file, and plays it back like captions over a
+video: the audio is the master clock and the baked ASCII frames are shown in
+sync. No WebSocket, no live encoding at watch time.
+
+**1. Bake the assets** (run once; shows a progress bar with ETA):
+```bash
+python stream_server.py video.mp4 --mode 5 --cols 240 --prerender
+```
+This writes to `videos/ascidata/` (created automatically):
+
+| file | contents |
+| :--- | :------- |
+| `<key>.aldata` | every frame as `[4B len][payload]` — binary modes reuse the adaptive codec, mode 1 stores the UTF-8 grid |
+| `<key>.mp3` | audio extracted at your `--vol` (omitted when `--vol 0`) |
+| `<key>.json` | manifest (fps, mode, grid size, frame count…) the browser reads to play it back |
+
+The `<key>` encodes everything that affects output (`video.m5.240x67`), so
+re-rendering at different settings never clobbers an existing bake. Works for all
+modes — including **mode 5 (16M colour)** and `--pixel`.
+
+**2. Play the baked assets:**
+```bash
+python stream_server.py video.mp4 --mode 5 --cols 240 --playback prerendered
+```
+Open `http://localhost:8000` and hit play — it streams the file from disk and
+plays the audio in sync. `--playback live` (the default) keeps the original
+real-time WebSocket behaviour, so you can switch back any time. `--playlist`,
+`--folder`, and `--loop` all work the same in both modes.
+
+> The grid size for playback is derived the same way as the bake, so the server
+> finds the matching assets automatically. If they're missing, the page tells
+> you to run `--prerender` first.
+
 **LAN / Network Streaming:**
 To stream the video on your local network (Wi-Fi), use the `--host` flag:
 > python stream_server.py video.mp4 --host 0.0.0.0

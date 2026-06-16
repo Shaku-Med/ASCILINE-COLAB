@@ -13,10 +13,12 @@ Priority Order:
 import asyncio
 import subprocess
 import json
+import re
+import struct
 import numpy as np
 import cv2
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
@@ -56,6 +58,10 @@ def calc_auto_rows(cols: int, vid_w: int, vid_h: int, pixel_mode: bool) -> int:
 # Serve only whitelisted static files (security: prevents directory traversal)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_WHITELIST = {"app.js", "style.css", "codec.js"}
+
+# Pre-rendered assets (offline-baked ASCII frames + audio) live here.
+# Created on demand by --prerender; served back during --playback prerendered.
+ASCIDATA_DIR = os.path.join(BASE_DIR, "videos", "ascidata")
 
 @app.get("/static/{filename}")
 async def serve_static(filename: str):
@@ -151,6 +157,214 @@ def build_queue(args) -> list[dict]:
     return [{"video": resolve_video_path(args.video), "mode": args.mode, "vol": args.vol, "pixel": args.pixel, "cols": default_cols, "rows": args.rows}]
 
 
+# ── PRE-RENDER (offline encode) ────────────────────────────
+# The live WebSocket path decodes + ASCII-encodes every frame on the fly, which
+# means the CPU is doing that work the whole time you watch. --prerender does it
+# ONCE, ahead of time, and writes the result to videos/ascidata/:
+#
+#   <key>.aldata  binary frames: [4B len][frame payload] ...  (one per frame)
+#                 - modes 2-5 / pixel: payload is an adaptive-codec message
+#                   (same bytes the live socket sends), decoded by codec.js
+#                 - mode 1 (B&W text): payload is the UTF-8 character grid
+#   <key>.mp3     audio extracted via FFmpeg at the chosen --vol (omitted if vol 0)
+#   <key>.json    manifest the browser reads to play the above in sync
+#
+# Playback (--playback prerendered) then just streams the file + plays the audio
+# as master clock, like captions over a video — no live encoding at all.
+# ──────────────────────────────────────────────────────────
+
+def resolve_grid(entry: dict) -> tuple[int, int]:
+    """Return (cols, rows) for an entry, auto-calculating rows when unset.
+    Deterministic, so --prerender and --playback agree on the same asset key."""
+    cols     = entry.get("cols", 200)
+    rows_cfg = entry.get("rows", 0)
+    if rows_cfg and rows_cfg > 0:
+        return cols, rows_cfg
+    vid_w, vid_h = get_video_dimensions(entry["video"])
+    return cols, calc_auto_rows(cols, vid_w, vid_h, entry.get("pixel", False))
+
+
+def asset_key(entry: dict, cols: int, rows: int) -> str:
+    """Stable filename stem encoding everything that affects the output, so a
+    re-render with different settings doesn't collide with an old one."""
+    stem = os.path.splitext(os.path.basename(entry["video"]))[0]
+    stem = re.sub(r'[^A-Za-z0-9_.-]', '_', stem) or "video"
+    px   = "p" if entry.get("pixel") else ""
+    return f"{stem}.m{entry['mode']}{px}.{cols}x{rows}"
+
+
+def extract_audio(video_path: str, vol_level: int, out_path: str) -> bool:
+    """Bake audio to an mp3 file with the given volume (1-5 → 1.0x-2.0x).
+    Returns False if FFmpeg is missing or the source has no audio."""
+    ffmpeg_vol = 1.0 + (vol_level - 1) * 0.25
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-i", video_path, "-vn",
+             "-filter:a", f"volume={ffmpeg_vol}", "-acodec", "libmp3lame",
+             "-ab", "128k", "-ar", "44100", "-loglevel", "error", out_path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print("  \033[33m[WARN] FFmpeg not found — skipping audio for this video.\033[0m")
+        return False
+    if result.returncode != 0 or not os.path.exists(out_path):
+        print("  \033[33m[WARN] No audio track extracted (source may be silent).\033[0m")
+        return False
+    return True
+
+
+def _print_progress(done: int, total: int, start: float) -> None:
+    """In-place processing bar so the user isn't staring at a frozen blob."""
+    import time
+    elapsed = time.time() - start
+    rate    = done / elapsed if elapsed > 0 else 0.0
+    bar_w   = 28
+    if total > 0:
+        frac   = min(1.0, done / total)
+        filled = int(bar_w * frac)
+        bar    = "█" * filled + "░" * (bar_w - filled)
+        eta    = (total - done) / rate if rate > 0 else 0
+        m, s   = divmod(int(eta), 60)
+        print(f"\r    \033[35m[{bar}]\033[0m {frac*100:5.1f}%  "
+              f"{done}/{total}  {rate:4.0f} fps  ETA {m:d}:{s:02d}   ",
+              end="", flush=True)
+    else:
+        print(f"\r    {done} frames  {rate:4.0f} fps   ", end="", flush=True)
+
+
+def prerender_video(entry: dict, tolerance: int = 0) -> dict | None:
+    """Encode one video to videos/ascidata/ and return its manifest dict."""
+    path = resolve_video_path(entry["video"])
+    if not os.path.exists(path):
+        print(f"  \033[31m[SKIP] '{path}' not found.\033[0m")
+        return None
+
+    entry      = {**entry, "video": path}
+    cols       = entry.get("cols", 200)
+    pixel      = entry.get("pixel", False)
+    mode       = entry["mode"]
+    vol        = entry.get("vol", 1)
+    cols, rows = resolve_grid(entry)
+
+    os.makedirs(ASCIDATA_DIR, exist_ok=True)
+    key           = asset_key(entry, cols, rows)
+    data_path     = os.path.join(ASCIDATA_DIR, key + ".aldata")
+    manifest_path = os.path.join(ASCIDATA_DIR, key + ".json")
+
+    decoder       = VideoDecoder(path, cols, rows, skip_gray=pixel)
+    mapper        = AsciiMapper()
+    source_fps    = decoder.fps
+    total_frames  = decoder.frame_count
+    MAX_FPS       = 30
+    char_byte_lut = np.array([ord(c) for c in mapper._lut], dtype=np.uint8)
+    qb            = {5: 0, 4: 2, 3: 3, 2: 5}.get(mode, 0)
+
+    if source_fps > MAX_FPS:
+        skip_n        = round(source_fps / MAX_FPS)
+        effective_fps = source_fps / skip_n
+    else:
+        skip_n        = 1
+        effective_fps = source_fps
+
+    frame_buf  = np.empty((rows, cols, 4), dtype=np.uint8) if mode > 1 else None
+    prev_frame = None
+    nframes    = 0
+    cell_bytes = 0 if mode == 1 else (3 if pixel else 4)
+
+    print(f"  \033[36m{os.path.basename(path)}\033[0m → {key}  (mode={mode} "
+          f"pixel={pixel} {cols}x{rows} @ {effective_fps:.0f}fps)")
+
+    import time as _time
+    expected_total = (total_frames + skip_n - 1) // skip_n if total_frames > 0 else 0
+    start_t = _time.time()
+
+    try:
+        with open(data_path, "wb") as f:
+            while True:
+                for _ in range(skip_n - 1):
+                    if not decoder.grab():
+                        break
+                try:
+                    gray_frame, bgr_frame = next(decoder)
+                except StopIteration:
+                    break
+
+                if pixel:
+                    msg, prev_frame = encode_frame(
+                        np.ascontiguousarray(bgr_frame), prev_frame, nframes,
+                        tolerance=tolerance)
+                    payload = msg
+                elif mode == 1:
+                    indices = np.floor_divide(gray_frame, max(1, 256 // mapper._n))
+                    np.clip(indices, 0, mapper._n - 1, out=indices)
+                    char_matrix = mapper._lut[indices]
+                    text = "\n".join("".join(row) for row in char_matrix)
+                    payload = text.encode("utf-8")
+                else:
+                    indices = np.floor_divide(gray_frame, max(1, 256 // mapper._n))
+                    np.clip(indices, 0, mapper._n - 1, out=indices)
+                    char_codes = char_byte_lut[indices]
+                    rgb = bgr_frame[:, :, ::-1]
+                    if qb > 0:
+                        rgb = (rgb >> qb) << qb
+                    frame_buf[:, :, 0]  = char_codes
+                    frame_buf[:, :, 1:] = rgb
+                    msg, prev_frame = encode_frame(
+                        frame_buf, prev_frame, nframes, tolerance=tolerance)
+                    payload = msg
+
+                f.write(struct.pack(">I", len(payload)))
+                f.write(payload)
+                nframes += 1
+
+                if nframes % 15 == 0:
+                    _print_progress(nframes, expected_total, start_t)
+    finally:
+        decoder.release()
+    _print_progress(nframes, expected_total or nframes, start_t)
+    print()  # finish the progress line
+
+    audio_name = None
+    if vol > 0:
+        audio_name = key + ".mp3"
+        if not extract_audio(path, vol, os.path.join(ASCIDATA_DIR, audio_name)):
+            audio_name = None
+
+    manifest = {
+        "video":     os.path.basename(path),
+        "mode":      mode,
+        "pixel":     pixel,
+        "cols":      cols,
+        "rows":      rows,
+        "fps":       effective_fps,
+        "nframes":   nframes,
+        "cellBytes": cell_bytes,
+        "textMode":  mode == 1,
+        "data":      key + ".aldata",
+        "audio":     audio_name,
+        "duration":  nframes / effective_fps if effective_fps else 0,
+        "available": True,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as mf:
+        json.dump(manifest, mf)
+    return manifest
+
+
+def do_prerender(queue: list[dict], tolerance: int) -> None:
+    """Pre-render every queued video into videos/ascidata/, then return."""
+    print(f"\n\033[1;37m{'═'*55}\033[0m")
+    print(f" \033[35m⚙\033[0m  \033[1mPRE-RENDERING\033[0m {len(queue)} video(s) → \033[36mvideos/ascidata/\033[0m")
+    print(f"\033[1;37m{'─'*55}\033[0m")
+    done = 0
+    for entry in queue:
+        if prerender_video(entry, tolerance=tolerance):
+            done += 1
+    print(f"\033[1;37m{'─'*55}\033[0m")
+    print(f" \033[32m✔\033[0m  Done: {done}/{len(queue)} rendered into \033[36m{ASCIDATA_DIR}\033[0m")
+    print(f" \033[90m   Play them with:\033[0m --playback prerendered\n")
+
+
 # ── APP STATE ──────────────────────────────────────────────
 # Queue is stored in app.state so the WebSocket endpoint can read it.
 # current_index tracks which video is playing.
@@ -232,6 +446,51 @@ async def audio_stream(v: int | None = None):
         media_type="audio/mpeg",
         headers={"Accept-Ranges": "bytes"}
     )
+
+
+@app.get("/config")
+async def get_config():
+    """Tells the frontend which playback mode to use and, for prerendered mode,
+    the manifest of every queued video (with asset URLs)."""
+    playback = getattr(app.state, "playback", "live")
+    queue    = getattr(app.state, "queue", [])
+    loop     = getattr(app.state, "loop", False)
+    out: dict = {"playback": playback, "loop": loop, "queue": []}
+
+    if playback == "prerendered":
+        for entry in queue:
+            try:
+                cols, rows = resolve_grid(entry)
+                key   = asset_key(entry, cols, rows)
+                mpath = os.path.join(ASCIDATA_DIR, key + ".json")
+                if os.path.isfile(mpath):
+                    with open(mpath, "r", encoding="utf-8") as mf:
+                        out["queue"].append(json.load(mf))
+                else:
+                    out["queue"].append({
+                        "available": False,
+                        "video": os.path.basename(entry["video"]),
+                        "key": key,
+                    })
+            except FileNotFoundError:
+                out["queue"].append({
+                    "available": False,
+                    "video": os.path.basename(entry.get("video", "?")),
+                })
+    return JSONResponse(out)
+
+
+@app.get("/ascidata/{filename}")
+async def serve_ascidata(filename: str):
+    """Serve a pre-rendered asset (.aldata / .mp3 / .json). basename-only to
+    block path traversal — files live exclusively in ASCIDATA_DIR."""
+    safe = os.path.basename(filename)
+    if safe != filename or not safe:
+        raise HTTPException(status_code=404, detail="Not found")
+    path = os.path.join(ASCIDATA_DIR, safe)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(path)
 
 
 def _origin_allowed(origin: str | None, host_header: str | None = None) -> bool:
@@ -506,6 +765,8 @@ HELP_TEXT = "\033[1;37m" + """
 ║  \033[32m--vol\033[1;37m   \033[35m0-5\033[1;37m    Volume (0=mute, 1=normal, 5=2x)  ║
 ║  \033[32m--loop\033[1;37m         Loop the playlist infinitely     ║
 ║  \033[32m--quality\033[1;37m \033[35mlvl\033[1;37m  Codec quality (lossless,low,etc) ║
+║  \033[32m--playback\033[1;37m \033[35mX\033[1;37m   live | prerendered (file mode)   ║
+║  \033[32m--prerender\033[1;37m    Bake queue to videos/ascidata/   ║
 ║                                                   ║
 ║  \033[33m─── Server ───\033[1;37m                                  ║
 ║  \033[32m--port\033[1;37m  \033[35mN\033[1;37m      Server port    (default: 8000)    ║
@@ -624,6 +885,19 @@ if __name__ == "__main__":
         help="Adaptive-codec colour fidelity (lossless = bit-exact; lower = "
              "smaller stream via lossy temporal delta). Chars always exact."
     )
+    playback.add_argument(
+        "--playback",
+        choices=["live", "prerendered"], default="live",
+        help="live = encode frames on the fly over WebSocket (default).\n"
+             "prerendered = play baked files from videos/ascidata/ (build them\n"
+             "first with --prerender). Much lighter at watch time."
+    )
+    playback.add_argument(
+        "--prerender",
+        action="store_true", default=False,
+        help="Offline-encode the queue into videos/ascidata/ (frames + audio),\n"
+             "then exit. Run once; then watch with --playback prerendered."
+    )
 
     # ── Server ──
     srv = parser.add_argument_group('\033[33mServer\033[0m')
@@ -651,9 +925,17 @@ if __name__ == "__main__":
     app.state.loop          = args.loop
     app.state.tolerance     = {"lossless": 0, "high": 4, "balanced": 8, "low": 16}[args.quality]
     app.state.debug         = args.debug
+    app.state.playback      = args.playback
     global_default_cols     = args.cols if args.cols is not None else (450 if args.pixel else 200)
     app.state.cols          = global_default_cols
     app.state.rows          = args.rows
+
+    # ── PRE-RENDER BUILD STEP ──
+    # Bake the queue to videos/ascidata/ and exit. No server, no prompts.
+    if args.prerender:
+        print(ASCII_LOGO)
+        do_prerender(queue, app.state.tolerance)
+        exit(0)
 
     # ── High FPS Warning ──
     high_fps_videos = []
@@ -690,6 +972,8 @@ if __name__ == "__main__":
     res_str = f"{global_default_cols}x{args.rows}" if args.rows > 0 else f"{global_default_cols}x(auto)"
     print(f" \033[32m▶\033[0m \033[1mResolution\033[0m: {res_str}")
     print(f" \033[32m▶\033[0m \033[1mDefault\033[0m   : mode={args.mode} | pixel={'ON' if args.pixel else 'OFF'} | vol={args.vol}")
+    pb_label = '\033[35mPRE-RENDERED\033[0m' if args.playback == 'prerendered' else '\033[36mLIVE (stream)\033[0m'
+    print(f" \033[32m▶\033[0m \033[1mPlayback\033[0m  : {pb_label}")
     print(f"\033[1;37m{'─'*55}\033[0m")
     for i, entry in enumerate(queue, 1):
         px = ' \033[35m[PIXEL]\033[0m' if entry.get('pixel') else ''
