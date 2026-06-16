@@ -15,6 +15,7 @@ import subprocess
 import json
 import re
 import struct
+import math
 import numpy as np
 import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -27,7 +28,7 @@ from websockets.exceptions import ConnectionClosed
 
 # Import the existing engine (ascii_video_player2.py)
 from ascii_video_player2 import VideoDecoder, AsciiMapper
-from codec import encode_frame
+from codec import encode_frame, KEYFRAME_INTERVAL
 
 app = FastAPI()
 
@@ -233,7 +234,126 @@ def _print_progress(done: int, total: int, start: float) -> None:
         print(f"\r    {done} frames  {rate:4.0f} fps   ", end="", flush=True)
 
 
-def prerender_video(entry: dict, tolerance: int = 0) -> dict | None:
+def make_thumbnail(path: str, cols: int, rows: int, mode: int, pixel: bool,
+                   src_frame: int, out_path: str) -> bool:
+    """Render ONE representative frame to a self-contained ASCII poster.
+
+    Inspired by GoUpload's thumbnail/sprite-grid pipeline (extract frames →
+    lay out a grid), but ASCILINE already stores every frame in the .aldata
+    "grid", so we only need a single front poster: grab one frame, encode it as
+    a standalone keyframe (decodable on its own by codec.js), and write it out.
+    """
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return False
+    if src_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, src_frame)
+    ok, frame = cap.read()
+    if not ok:                      # seek overshot (short clip) → fall back to frame 0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return False
+
+    small  = cv2.resize(frame, (cols, rows), interpolation=cv2.INTER_LINEAR)
+    mapper = AsciiMapper()
+
+    if mode == 1:
+        gray    = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        indices = np.floor_divide(gray, max(1, 256 // mapper._n))
+        np.clip(indices, 0, mapper._n - 1, out=indices)
+        payload = "\n".join("".join(r) for r in mapper._lut[indices]).encode("utf-8")
+    elif pixel:
+        payload, _ = encode_frame(np.ascontiguousarray(small), None, 0)
+    else:
+        gray    = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        indices = np.floor_divide(gray, max(1, 256 // mapper._n))
+        np.clip(indices, 0, mapper._n - 1, out=indices)
+        lut = np.array([ord(c) for c in mapper._lut], dtype=np.uint8)
+        qb  = {5: 0, 4: 2, 3: 3, 2: 5}.get(mode, 0)
+        rgb = small[:, :, ::-1]
+        if qb > 0:
+            rgb = (rgb >> qb) << qb
+        fb = np.empty((rows, cols, 4), dtype=np.uint8)
+        fb[:, :, 0]  = lut[indices]
+        fb[:, :, 1:] = rgb
+        payload, _ = encode_frame(fb, None, 0)
+
+    with open(out_path, "wb") as f:
+        f.write(payload)
+    return True
+
+
+def make_seek_sprite(path: str, src_fps: float, total_src_frames: int,
+                     out_path: str, max_count: int = 100,
+                     min_interval: float = 1.0, cell_w: int = 160) -> dict | None:
+    """Build a YouTube-style scrub-preview sprite: sample frames across the video,
+    tile them into one square-ish grid image, and return the layout so the client
+    can show the right cell as you hover the seek bar.
+
+    This is the GoUpload thumbnail-grid idea (sample frames → lay out a sprite +
+    a time map), kept light: one JPEG plus a few numbers in the manifest.
+    """
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+    duration = (total_src_frames / src_fps) if src_fps else 0
+    if duration <= 0:
+        cap.release()
+        return None
+
+    interval = max(min_interval, duration / max_count)
+    times = []
+    t = 0.0
+    while t < duration and len(times) < max_count:
+        times.append(t)
+        t += interval
+    if not times:
+        times = [0.0]
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    ok, first = cap.read()
+    if not ok:
+        cap.release()
+        return None
+    h0, w0 = first.shape[:2]
+    cell_h = max(1, round(cell_w * h0 / max(1, w0)))
+
+    n         = len(times)
+    grid_cols = max(1, math.ceil(math.sqrt(n)))
+    grid_rows = max(1, math.ceil(n / grid_cols))
+    sheet     = np.zeros((grid_rows * cell_h, grid_cols * cell_w, 3), dtype=np.uint8)
+
+    for i, tt in enumerate(times):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(tt * src_fps))
+        ok, fr = cap.read()
+        if not ok:
+            continue
+        cell = cv2.resize(fr, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+        r, c = divmod(i, grid_cols)
+        sheet[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w] = cell
+    cap.release()
+
+    ok, buf = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if not ok:
+        return None
+    with open(out_path, "wb") as f:
+        f.write(buf.tobytes())
+
+    return {
+        "sprite":   os.path.basename(out_path),
+        "count":    n,
+        "gridCols": grid_cols,
+        "gridRows": grid_rows,
+        "cellW":    cell_w,
+        "cellH":    cell_h,
+        "interval": interval,
+    }
+
+
+def prerender_video(entry: dict, tolerance: int = 0, thumbnail: bool = False,
+                    seek_thumbs: bool = False) -> dict | None:
     """Encode one video to videos/ascidata/ and return its manifest dict."""
     path = resolve_video_path(entry["video"])
     if not os.path.exists(path):
@@ -331,34 +451,66 @@ def prerender_video(entry: dict, tolerance: int = 0) -> dict | None:
         if not extract_audio(path, vol, os.path.join(ASCIDATA_DIR, audio_name)):
             audio_name = None
 
+    # ── Single ASCII poster thumbnail (CLI-optional) ──
+    # Grab a representative frame ~10% into the clip (skips black intros) and
+    # bake it as a standalone keyframe the client can render before playback.
+    thumb_name = None
+    if thumbnail and nframes > 0:
+        thumb_name   = key + ".thumb"
+        thumb_dframe = int(nframes * 0.1)               # decimated index
+        src_frame    = thumb_dframe * skip_n            # source-frame index
+        if make_thumbnail(path, cols, rows, mode, pixel, src_frame,
+                          os.path.join(ASCIDATA_DIR, thumb_name)):
+            print(f"    \033[35m◧\033[0m thumbnail ← frame {thumb_dframe}")
+        else:
+            thumb_name = None
+
+    # ── Scrub-preview sprite grid (CLI-optional, YouTube-style hover) ──
+    seek_meta = None
+    if seek_thumbs and total_frames > 0:
+        sprite_path = os.path.join(ASCIDATA_DIR, key + ".sprite.jpg")
+        seek_meta = make_seek_sprite(path, source_fps, total_frames, sprite_path)
+        if seek_meta:
+            print(f"    \033[35m▦\033[0m seek sprite: {seek_meta['count']} frames "
+                  f"({seek_meta['gridCols']}x{seek_meta['gridRows']} grid)")
+
     manifest = {
-        "video":     os.path.basename(path),
-        "mode":      mode,
-        "pixel":     pixel,
-        "cols":      cols,
-        "rows":      rows,
-        "fps":       effective_fps,
-        "nframes":   nframes,
-        "cellBytes": cell_bytes,
-        "textMode":  mode == 1,
-        "data":      key + ".aldata",
-        "audio":     audio_name,
-        "duration":  nframes / effective_fps if effective_fps else 0,
-        "available": True,
+        "video":           os.path.basename(path),
+        "mode":            mode,
+        "pixel":           pixel,
+        "cols":            cols,
+        "rows":            rows,
+        "fps":             effective_fps,
+        "nframes":         nframes,
+        "cellBytes":       cell_bytes,
+        "textMode":        mode == 1,
+        "keyframeInterval": 1 if mode == 1 else KEYFRAME_INTERVAL,
+        "data":            key + ".aldata",
+        "audio":           audio_name,
+        "thumb":           thumb_name,
+        "seekThumbs":      seek_meta,
+        "duration":        nframes / effective_fps if effective_fps else 0,
+        "available":       True,
     }
     with open(manifest_path, "w", encoding="utf-8") as mf:
         json.dump(manifest, mf)
     return manifest
 
 
-def do_prerender(queue: list[dict], tolerance: int) -> None:
+def do_prerender(queue: list[dict], tolerance: int, thumbnail: bool = False,
+                 seek_thumbs: bool = False) -> None:
     """Pre-render every queued video into videos/ascidata/, then return."""
+    extras = []
+    if thumbnail:   extras.append("poster")
+    if seek_thumbs: extras.append("seek-sprite")
+    tag = f"  (+{', '.join(extras)})" if extras else ""
     print(f"\n\033[1;37m{'═'*55}\033[0m")
-    print(f" \033[35m⚙\033[0m  \033[1mPRE-RENDERING\033[0m {len(queue)} video(s) → \033[36mvideos/ascidata/\033[0m")
+    print(f" \033[35m⚙\033[0m  \033[1mPRE-RENDERING\033[0m {len(queue)} video(s) → \033[36mvideos/ascidata/\033[0m{tag}")
     print(f"\033[1;37m{'─'*55}\033[0m")
     done = 0
     for entry in queue:
-        if prerender_video(entry, tolerance=tolerance):
+        if prerender_video(entry, tolerance=tolerance, thumbnail=thumbnail,
+                           seek_thumbs=seek_thumbs):
             done += 1
     print(f"\033[1;37m{'─'*55}\033[0m")
     print(f" \033[32m✔\033[0m  Done: {done}/{len(queue)} rendered into \033[36m{ASCIDATA_DIR}\033[0m")
@@ -767,6 +919,8 @@ HELP_TEXT = "\033[1;37m" + """
 ║  \033[32m--quality\033[1;37m \033[35mlvl\033[1;37m  Codec quality (lossless,low,etc) ║
 ║  \033[32m--playback\033[1;37m \033[35mX\033[1;37m   live | prerendered (file mode)   ║
 ║  \033[32m--prerender\033[1;37m    Bake queue to videos/ascidata/   ║
+║  \033[32m--thumbnail\033[1;37m    Bake ASCII poster (w/ prerender) ║
+║  \033[32m--seek-thumbs\033[1;37m  Scrub preview grid (w/ prerender)║
 ║                                                   ║
 ║  \033[33m─── Server ───\033[1;37m                                  ║
 ║  \033[32m--port\033[1;37m  \033[35mN\033[1;37m      Server port    (default: 8000)    ║
@@ -898,6 +1052,18 @@ if __name__ == "__main__":
         help="Offline-encode the queue into videos/ascidata/ (frames + audio),\n"
              "then exit. Run once; then watch with --playback prerendered."
     )
+    playback.add_argument(
+        "--thumbnail",
+        action="store_true", default=False,
+        help="With --prerender: also bake a single ASCII poster thumbnail\n"
+             "(shown on the client before playback)."
+    )
+    playback.add_argument(
+        "--seek-thumbs",
+        action="store_true", default=False,
+        help="With --prerender: also bake a scrub-preview sprite grid so the\n"
+             "seek bar shows a thumbnail under your cursor (YouTube-style)."
+    )
 
     # ── Server ──
     srv = parser.add_argument_group('\033[33mServer\033[0m')
@@ -934,7 +1100,8 @@ if __name__ == "__main__":
     # Bake the queue to videos/ascidata/ and exit. No server, no prompts.
     if args.prerender:
         print(ASCII_LOGO)
-        do_prerender(queue, app.state.tolerance)
+        do_prerender(queue, app.state.tolerance, thumbnail=args.thumbnail,
+                     seek_thumbs=args.seek_thumbs)
         exit(0)
 
     # ── High FPS Warning ──
