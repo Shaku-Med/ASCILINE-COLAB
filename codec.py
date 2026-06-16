@@ -69,30 +69,35 @@ def encode_frame(frame: np.ndarray, prev: np.ndarray | None, frame_index: int,
         return _full_frame(raw, frame_index, level), frame.copy()
 
     C = frame.shape[2]
-    diff = np.abs(frame.astype(np.int16) - prev.astype(np.int16))
-    if C == 4:
-        # channel 0 is the character (structure) -> exact; tolerance on colour
-        char_changed = frame[:, :, 0] != prev[:, :, 0]
-        if tolerance <= 0:
-            color_changed = np.any(diff[:, :, 1:] != 0, axis=2)
-        else:
-            color_changed = np.any(diff[:, :, 1:] > tolerance, axis=2)
-        changed = char_changed | color_changed
+
+    # ── Which cells changed? ──
+    # Lossless (tolerance=0, the default) only needs equality, so a direct uint8
+    # comparison suffices — avoids upcasting the WHOLE frame to int16 and an
+    # abs() over it every frame. Only the lossy path needs drift magnitude, and
+    # there only on the colour channels.
+    if tolerance <= 0:
+        changed = np.any(frame != prev, axis=2)
+    elif C == 4:
+        # channel 0 is the character (structure) -> always exact; tolerance on colour
+        diff = np.abs(frame[:, :, 1:].astype(np.int16) - prev[:, :, 1:].astype(np.int16))
+        changed = (frame[:, :, 0] != prev[:, :, 0]) | np.any(diff > tolerance, axis=2)
     else:
-        changed = (np.any(diff != 0, axis=2) if tolerance <= 0
-                   else np.any(diff > tolerance, axis=2))
+        diff = np.abs(frame.astype(np.int16) - prev.astype(np.int16))
+        changed = np.any(diff > tolerance, axis=2)
 
     frac = float(changed.mean())
-    ci = np.nonzero(changed.reshape(-1))[0].astype("<u4")
-
-    # Lossy reconstruction the client will hold if we send a DELTA.
-    delta_shown = prev.copy()
-    delta_shown.reshape(-1, C)[ci] = frame.reshape(-1, C)[ci]
 
     candidates = []  # (tag, payload, shown_after_decode)
+    # Only build the DELTA candidate when motion is low enough for it to win.
+    # The nonzero scan + full prev copy + scatter write are pure waste in the
+    # high-motion case — which is exactly when the CPU is most stressed.
     if frac < _DELTA_MAX_FRAC:
+        ci = np.nonzero(changed.reshape(-1))[0].astype("<u4")
         vals = frame.reshape(-1, C)[ci]
         delta = zlib.compress(ci.tobytes() + vals.tobytes(), level)
+        # Lossy reconstruction the client will hold if we send this DELTA.
+        delta_shown = prev.copy()
+        delta_shown.reshape(-1, C)[ci] = vals
         candidates.append((TAG_DELTA, delta, delta_shown))
     if frac >= _ZLIB_MIN_FRAC or not candidates:
         candidates.append((TAG_ZLIB, zlib.compress(raw, level), frame))
