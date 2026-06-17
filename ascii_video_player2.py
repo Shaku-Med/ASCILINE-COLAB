@@ -72,6 +72,12 @@ class VideoDecoder:
         Used by stream_server for FPS decimation of high-FPS sources."""
         return self._cap.grab()
 
+    def seek(self, target_sec: float) -> bool:
+        """Seeks the video capture to the specified target second."""
+        if self._cap:
+            return self._cap.set(cv2.CAP_PROP_POS_MSEC, target_sec * 1000)
+        return False
+
     def __del__(self):
         self.release()
 

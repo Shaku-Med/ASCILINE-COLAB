@@ -15,6 +15,18 @@ const overlay   = document.getElementById('play-overlay');
 const audioEl   = document.getElementById('ascii-audio');
 const volumeSlider = document.getElementById('volume-slider');
 
+const playPauseBtn = document.getElementById('play-pause-btn');
+const seekBar = document.getElementById('seek-slider');
+const timeCurrent = document.getElementById('time-current');
+const timeTotal = document.getElementById('time-total');
+
+function formatTime(seconds) {
+    if (isNaN(seconds) || seconds < 0) return "00:00";
+    const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+    const s = Math.floor(seconds % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+}
+
 // ── STATE ──
 let state = 'IDLE'; // IDLE | PLAYING | PAUSED
 let ws = null;
@@ -27,6 +39,10 @@ let renderMode = 1;
 let pixelMode = false;
 let readyToRender = false;
 let pauseStartTime = 0;
+let duration = 0;
+let isSeeking = false;
+let currentQueueIdx = 0;
+let audioOffset = 0;
 
 // Grid & Dimensions
 let gridCols = 0, gridRows = 0;
@@ -44,6 +60,8 @@ let selectionBuffer = null;
 let lastRenderTime = 0;
 let frameCount = 0, currentFps = 0, lastFpsUpdate = 0;
 let streamStartTime = 0;
+let lastUiUpdateTime = 0;
+let lastFormattedTime = "";
 
 const CHAR_LUT = new Array(128);
 for (let i = 0; i < 128; i++) CHAR_LUT[i] = String.fromCharCode(i);
@@ -166,6 +184,18 @@ function connectWebSocket() {
                 renderMode = parseInt(p[2]);
                 pixelMode = (p.length > 5 && parseInt(p[5]) === 1);
                 const currentQueueIndex = (p.length > 6) ? parseInt(p[6]) : null;
+                duration = (p.length > 7) ? parseFloat(p[7]) : 0;
+                currentQueueIdx = currentQueueIndex !== null ? currentQueueIndex : 0;
+                
+                if (seekBar) {
+                    seekBar.max = duration;
+                    seekBar.value = 0;
+                }
+                if (timeTotal) timeTotal.textContent = formatTime(duration);
+                if (timeCurrent) timeCurrent.textContent = "00:00";
+                
+                audioOffset = 0;
+                
                 buildCanvas(parseInt(p[3]), parseInt(p[4]));
 
                 // Initialize adaptive codec decoder (pixel=3 bytes, ASCII color=4 bytes)
@@ -268,20 +298,33 @@ function renderFrame(now) {
     if (state !== 'PLAYING' || !readyToRender) return;
     requestAnimationFrame(renderFrame);
 
-    // ── MASTER CLOCK LOGIC ──
     let masterClock;
     if (audioEl && audioEl.readyState >= 1 && !audioEl.paused) {
-        masterClock = audioEl.currentTime;
+        masterClock = audioEl.currentTime + audioOffset;
     } else {
         masterClock = (now - streamStartTime) / 1000.0;
+    }
+
+    if (!isSeeking && seekBar) {
+        if (now - lastUiUpdateTime >= 100) {
+            seekBar.value = masterClock;
+            lastUiUpdateTime = now;
+        }
+        const formattedTime = formatTime(masterClock);
+        if (timeCurrent && formattedTime !== lastFormattedTime) {
+            timeCurrent.textContent = formattedTime;
+            lastFormattedTime = formattedTime;
+        }
     }
 
     if (frameBuffer.length === 0) return;
 
     // A/V Sync: Drop frames that are too far behind the master clock (catch up)
-    while (frameBuffer.length > 1 && frameBuffer[0].time < masterClock - 0.1) {
+    while (frameBuffer.length > 0 && frameBuffer[0].time < masterClock - 0.1) {
         frameBuffer.shift();
     }
+    
+    if (frameBuffer.length === 0) return;
 
     // A/V Sync: Wait if the frame is in the future
     if (frameBuffer[0].time > masterClock + 0.05) {
@@ -368,6 +411,7 @@ function finishStream() {
     overlay.classList.remove('hidden');
     statusEl.textContent = 'Ready';
     statusEl.style.color = 'rgba(255,255,255,0.6)';
+    if (playPauseBtn) playPauseBtn.textContent = '▶';
     readyToRender = false;
     pauseStartTime = 0;
     frameBuffer.length = 0;
@@ -381,24 +425,32 @@ function togglePause() {
     if (state === 'PLAYING') {
         state = 'PAUSED';
         pauseStartTime = performance.now();
-        // Live stream approach: mute audio instead of pausing it,
-        // so the master clock keeps ticking with the server.
+        
         if (audioEl && !audioEl.paused) {
-            audioEl.dataset.prePauseVolume = audioEl.volume;
-            audioEl.volume = 0;
+            audioEl.pause();
+        }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'pause', paused: true }));
         }
         container.classList.add('paused');
+        if (playPauseBtn) playPauseBtn.textContent = '▶';
         statusEl.textContent = '❚❚ PAUSED';
         statusEl.style.color = '#888';
     } else if (state === 'PAUSED') {
         state = 'PLAYING';
+        
+        // Update streamStartTime to account for the pause duration
+        const pauseDuration = performance.now() - pauseStartTime;
+        streamStartTime += pauseDuration;
         pauseStartTime = 0;
         
-        // Restore audio volume
-        if (audioEl && !audioEl.paused) {
-            audioEl.volume = audioEl.dataset.prePauseVolume !== undefined 
-                ? parseFloat(audioEl.dataset.prePauseVolume) 
-                : (volumeSlider ? volumeSlider.value : 1.0);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'pause', paused: false }));
+        }
+        
+        // Restore audio playback
+        if (audioEl && audioEl.paused) {
+            audioEl.play().catch(() => {});
         }
 
         // Flush stale buffer frames — A/V sync catch-up handles the rest
@@ -409,11 +461,76 @@ function togglePause() {
         statusEl.style.color = 'var(--accent-color)';
         
         // Restart render loop
+        if (playPauseBtn) playPauseBtn.textContent = '❚❚';
         lastRenderTime = performance.now();
         lastFpsUpdate = performance.now();
         frameCount = 0;
         requestAnimationFrame(renderFrame);
     }
+}
+
+if (playPauseBtn) {
+    playPauseBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (state === 'IDLE') startStream();
+        else togglePause();
+    });
+}
+
+if (seekBar) {
+    seekBar.addEventListener('input', () => {
+        isSeeking = true;
+        if (timeCurrent) timeCurrent.textContent = formatTime(seekBar.value);
+    });
+    
+    seekBar.addEventListener('change', () => {
+        const targetSec = parseFloat(seekBar.value);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'seek', time: targetSec }));
+        }
+        
+        // Clear buffer so we don't render stale frames
+        frameBuffer.length = 0;
+        audioOffset = targetSec;
+        
+        // Reload audio with correct start offset
+        if (audioEl) {
+            audioEl.pause();
+            const qs = `?v=${currentQueueIdx}&start=${targetSec}&`;
+            audioEl.src = `/audio${qs}t=${Date.now()}`;
+            audioEl.load();
+            
+            if (state === 'PLAYING') {
+                readyToRender = false;
+                audioEl.play().catch(() => {});
+                
+                const onAudioStart = () => {
+                    if (!readyToRender) {
+                        readyToRender = true;
+                        streamStartTime = performance.now() - (targetSec * 1000.0);
+                        lastRenderTime = performance.now();
+                        lastFpsUpdate = performance.now();
+                        frameCount = 0;
+                        requestAnimationFrame(renderFrame);
+                    }
+                };
+                
+                if (audioEl.readyState >= 3) {
+                    onAudioStart();
+                } else {
+                    audioEl.addEventListener('playing', onAudioStart, { once: true });
+                    // Fallback in case audio is muted or fails to play
+                    setTimeout(onAudioStart, 500);
+                }
+            } else {
+                streamStartTime = performance.now() - (targetSec * 1000.0);
+            }
+        } else {
+            streamStartTime = performance.now() - (targetSec * 1000.0);
+        }
+        
+        isSeeking = false;
+    });
 }
 
 // ── EVENT LISTENERS ──
