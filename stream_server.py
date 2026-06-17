@@ -530,7 +530,7 @@ async def root():
 
 
 @app.get("/audio")
-async def audio_stream(v: int | None = None):
+async def audio_stream(v: int | None = None, start: float = 0.0):
     """
     Extracts and streams audio from the currently active video entry.
     Server-side volume control via the entry's 'vol' field (0-5 scale).
@@ -560,38 +560,48 @@ async def audio_stream(v: int | None = None):
     # Map 1-5 → 1.0x-2.0x FFmpeg volume
     ffmpeg_vol = 1.0 + (vol_level - 1) * 0.25
 
-    def audio_generator():
-        process = subprocess.Popen(
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-i", video_path,
-                "-vn",
-                "-filter:a", f"volume={ffmpeg_vol}",
-                "-acodec", "libmp3lame",
-                "-ab", "128k",
-                "-ar", "44100",
-                "-f", "mp3",
-                "-loglevel", "quiet",
-                "pipe:1"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
+    async def audio_generator():
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-nostdin"
+        ]
+        if start > 0:
+            ffmpeg_cmd.extend(["-ss", str(start)])
+        
+        ffmpeg_cmd.extend([
+            "-i", video_path,
+            "-vn",
+            "-filter:a", f"volume={ffmpeg_vol}",
+            "-acodec", "libmp3lame",
+            "-ab", "128k",
+            "-ar", "44100",
+            "-f", "mp3",
+            "-loglevel", "quiet",
+            "pipe:1"
+        ])
+        
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
         )
         try:
             while True:
-                chunk = process.stdout.read(4096)
+                chunk = await process.stdout.read(4096)
                 if not chunk:
                     break
                 yield chunk
+        except asyncio.CancelledError:
+            pass
         finally:
-            process.stdout.close()
             try:
                 process.terminate()
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
 
     return StreamingResponse(
         audio_generator(),
@@ -756,7 +766,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 effective_fps = source_fps
             frame_t = 1.0 / effective_fps
 
-            await websocket.send_text(f"INIT:{effective_fps}:{render_mode}:{cols}:{rows}:{int(pixel_mode)}:{queue_index}")
+            duration = decoder.frame_count / decoder.fps if decoder.fps > 0 else 0
+            await websocket.send_text(f"INIT:{effective_fps}:{render_mode}:{cols}:{rows}:{int(pixel_mode)}:{queue_index}:{duration:.3f}")
             if skip_n > 1:
                 print(f"[FPS CAP] {source_fps} FPS → {effective_fps} FPS (skip every {skip_n} frames)")
 
@@ -780,9 +791,41 @@ async def websocket_endpoint(websocket: WebSocket):
                 # ASCII Color: 4-byte header + [char,R,G,B] per pixel
                 ascii_send_buf = bytearray(4 + rows * cols * 4)
 
+            cmd_queue = asyncio.Queue()
+            is_paused = False
+
+            async def receive_commands():
+                try:
+                    while True:
+                        msg = await websocket.receive_json()
+                        await cmd_queue.put(msg)
+                except Exception:
+                    pass
+            
+            receive_task = asyncio.create_task(receive_commands())
+
             raw_frame_num = 0
             try:
                 while True:
+                    while not cmd_queue.empty():
+                        msg = cmd_queue.get_nowait()
+                        if msg.get("type") == "pause":
+                            is_paused = msg.get("paused", False)
+                            if not is_paused:
+                                start_time = asyncio.get_event_loop().time() - (frame_index * frame_t)
+                                bw_start_time = time.time()
+                        elif msg.get("type") == "seek":
+                            target_sec = float(msg.get("time", 0))
+                            decoder.seek(target_sec)
+                            prev_frame = None
+                            frame_index = int(target_sec * effective_fps)
+                            start_time = asyncio.get_event_loop().time() - (frame_index * frame_t)
+                            bw_start_time = time.time()
+
+                    if is_paused:
+                        await asyncio.sleep(0.1)
+                        continue
+
                     # ── FPS DECIMATION via grab() ──
                     # For 60→30 fps: grab (skip) 1 frame, then decode 1 frame.
                     # grab() is ~10x faster than read() because it skips decoding.
@@ -864,6 +907,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     frame_index += 1
 
             finally:
+                receive_task.cancel()
                 decoder.release()
 
             # Video finished → advance queue
@@ -876,7 +920,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     print("[DONE] All videos finished.")
                     break
 
-    except (WebSocketDisconnect, ConnectionClosed):
+    except (WebSocketDisconnect, ConnectionClosed, RuntimeError):
         print("Client disconnected from the stream.")
 
 
